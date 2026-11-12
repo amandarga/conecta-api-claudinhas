@@ -3,3 +3,5 @@ dados/
 .env
 *.zip
 __pycache__/
+*.json
+*.json.gz
