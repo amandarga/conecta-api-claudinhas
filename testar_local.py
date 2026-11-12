@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
 """Teste local das rotas, lendo os CSVs do disco (sem S3 e sem boto3).
 
-Uso:  python testar_local.py
+Uso:  py testar_local.py
 Procura os CSVs em .\\dados\\ ; se não existir, usa a pasta deste script.
+
+A v2 também precisa da pasta .\\saida\\ (ao lado deste script) com os arquivos do modelo:
+  reco_api.json.gz, afinidade_faixa.json e em_alta_faixa.json
+baixados de s3://claudinhas-dados-hack/saida/
 """
 import json
 import os
@@ -18,6 +22,8 @@ AQUI = os.path.dirname(os.path.abspath(__file__))
 PASTA = os.path.join(AQUI, "dados")
 if not os.path.exists(os.path.join(PASTA, "servicos.csv")):
     PASTA = AQUI
+PASTA_SAIDA = os.path.join(AQUI, "saida")
+ARQUIVOS_SAIDA = ("reco_api.json.gz", "afinidade_faixa.json", "em_alta_faixa.json")
 
 CASOS = [
     ("C007938", {"interesses": "Saúde|Educação", "consentimento_saude": "true"}),
@@ -35,9 +41,14 @@ def chamar(caminho, qs=None):
 
 
 def main():
+    faltam = [n for n in ARQUIVOS_SAIDA if not os.path.exists(os.path.join(PASTA_SAIDA, n))]
+    if faltam:
+        sys.exit(f"Faltam em {PASTA_SAIDA}: {', '.join(faltam)}\n"
+                 "Baixe de s3://claudinhas-dados-hack/saida/ antes de rodar o teste.")
+
     t0 = time.perf_counter()
-    lf.carregar_da_pasta(PASTA)
-    print(f"CSVs lidos de {PASTA} em {time.perf_counter() - t0:.1f}s "
+    lf.carregar_da_pasta(PASTA, PASTA_SAIDA)
+    print(f"CSVs lidos de {PASTA} e modelo de {PASTA_SAIDA} em {time.perf_counter() - t0:.1f}s "
           f"({len(lf.D['servicos'])} serviços, {len(lf.D['cidadaos'])} cidadãos)\n")
 
     status, corpo, ms = chamar("/temas")

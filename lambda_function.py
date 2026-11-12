@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Conecta Recife - API de home personalizada (v1).
+"""Conecta Recife - API de home personalizada (v2).
 
 AWS Lambda (Python 3.12) atrás de uma Function URL. Sem pandas: só csv, json e boto3.
 
@@ -8,14 +8,17 @@ Rotas:
   GET /home?cidadao_id=C007938&interesses=Saúde|Educação&consentimento_saude=true
 
 Os CSVs são lidos do S3 (variável de ambiente BUCKET, PREFIXO opcional) uma única
-vez, na inicialização, e todos os agrupamentos ficam pré-calculados em memória.
+vez, na inicialização. As sugestões vêm do modelo pré-calculado (saida/reco_api.json.gz);
+o ajuste por faixa etária usa saida/afinidade_faixa.json e o "em alta" usa
+saida/em_alta_faixa.json. Tudo fica em variáveis globais.
 """
 import csv
+import gzip
 import io
 import json
 import os
 import unicodedata
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict  # noqa: F401
 from urllib.parse import unquote_plus
 
 ARQUIVOS = ("servicos", "cidadaos", "historico", "uso_semanal")
@@ -24,12 +27,9 @@ MAX_CONTINUE = 3
 MAX_SUGESTOES = 10
 MAX_EM_ALTA = 5
 SEMANAS_EM_ALTA = 4       # janela usada para o "em alta"
-MIN_GRUPO = 30            # grupo menor que isso cai para um grupo mais amplo
-BONUS_INTERESSE_MULT = 1.5
-BONUS_INTERESSE_SOMA = 5.0
-BONUS_SAUDE_MULT = 1.2
-BONUS_SAUDE_SOMA = 2.0
-TEMA_SAUDE = "saude"
+AFINIDADE_MIN = 0.5       # abaixo disso (na faixa etária) o serviço vai para o fim da lista
+SOBE_INTERESSE = 2        # serviço de tema de interesse sobe no máximo 2 posições
+PREFIXO_SAIDA = "saida/"
 
 MARCADORES_SAUDE = ("hipertensao", "diabetes", "saude_mental", "gestante")
 COM_CRIANCAS = {"crianca", "adolescente", "primeira_infancia"}
@@ -84,15 +84,9 @@ def _faixa_texto(faixa):
 # ----------------------------------------------------------------------------
 # Carga e pré-cálculo
 # ----------------------------------------------------------------------------
-def _chave(c, com_gestante):
-    """Chave de "cidadãos parecidos": faixa etária + marcadores principais."""
-    base = (c["faixa_etaria"], c["cadastro_unico"], c["empreende"],
-            c["pessoa_com_deficiencia"], c["tem_criancas"])
-    return base + (c["gestante"],) if com_gestante else base
-
-
-def carregar(abrir):
-    """Lê os 4 CSVs e pré-calcula tudo. `abrir(nome)` devolve um arquivo-texto."""
+def carregar(abrir, ler_saida):
+    """Lê os 4 CSVs e os arquivos de saida/. `abrir(nome)` devolve um arquivo-texto;
+    `ler_saida(nome)` devolve os bytes de saida/<nome>."""
     # --- serviços (só as colunas necessárias ficam em memória) ---
     servicos = {}
     temas = set()
@@ -148,20 +142,6 @@ def carregar(abrir):
             if quando > u.get(sid, ""):
                 u[sid] = quando
 
-    # --- popularidade por grupo (nº de cidadãos distintos que usaram cada serviço) ---
-    # Níveis: perfil completo com gestante (só com consentimento), perfil sem
-    # gestante, só faixa etária e geral. Grupo pequeno cai para o nível seguinte.
-    tam = Counter()
-    pop = defaultdict(Counter)
-    for cid, c in cidadaos.items():
-        chaves = (("g", _chave(c, True)), ("p", _chave(c, False)),
-                  ("f", c["faixa_etaria"]), ("t",))
-        usados = list(usos.get(cid, ()))
-        for k in chaves:
-            tam[k] += 1
-            if usados:
-                pop[k].update(usados)
-
     # --- em alta: cliques nas semanas mais recentes ---
     por_semana = defaultdict(Counter)
     with abrir("uso_semanal") as f:
@@ -178,10 +158,17 @@ def carregar(abrir):
     # Ordem padrão de desempate: mais cliques no histórico primeiro.
     ordem = sorted(servicos, key=lambda s: (-servicos[s]["cliques"], _int(s)))
 
+    # --- saída do modelo (carregada uma vez e mantida em variável global) ---
+    bruto = json.loads(gzip.decompress(ler_saida("reco_api.json.gz")).decode("utf-8"))
+    afinidade = json.loads(ler_saida("afinidade_faixa.json").decode("utf-8"))
+    alta_faixa = json.loads(ler_saida("em_alta_faixa.json").decode("utf-8"))
+
     D.clear()
-    D.update(servicos=servicos, cidadaos=cidadaos, usos=dict(usos), tam=tam,
-             pop=dict(pop), em_alta=em_alta[:50], n_semanas=len(recentes),
-             ordem=ordem, temas=sorted(temas, key=_norm))
+    D.update(servicos=servicos, cidadaos=cidadaos, usos=dict(usos),
+             em_alta=em_alta[:50], n_semanas=len(recentes),
+             ordem=ordem, temas=sorted(temas, key=_norm),
+             motivos=bruto["motivos"], reco=bruto["reco"],
+             afinidade=afinidade, alta_faixa=alta_faixa)
 
 
 def carregar_do_s3():
@@ -194,42 +181,27 @@ def carregar_do_s3():
         corpo = s3.get_object(Bucket=bucket, Key=f"{prefixo}{nome}.csv")["Body"].read()
         return io.StringIO(corpo.decode("utf-8-sig"), newline="")
 
-    carregar(abrir)
+    def ler_saida(nome):
+        return s3.get_object(Bucket=bucket, Key=f"{PREFIXO_SAIDA}{nome}")["Body"].read()
+
+    carregar(abrir, ler_saida)
 
 
-def carregar_da_pasta(pasta):
-    """Para teste local: lê os CSVs de uma pasta, sem S3."""
+def carregar_da_pasta(pasta, pasta_saida):
+    """Para teste local: lê os CSVs de uma pasta e os arquivos de saída de outra, sem S3."""
     def abrir(nome):
         return open(os.path.join(pasta, f"{nome}.csv"), encoding="utf-8-sig", newline="")
 
-    carregar(abrir)
+    def ler_saida(nome):
+        with open(os.path.join(pasta_saida, nome), "rb") as f:
+            return f.read()
+
+    carregar(abrir, ler_saida)
 
 
 # ----------------------------------------------------------------------------
 # Montagem da home
 # ----------------------------------------------------------------------------
-def _grupo(c, consentimento):
-    """Escolhe o grupo de parecidos mais específico que tenha gente suficiente."""
-    niveis = []
-    if consentimento:
-        niveis.append((("g", _chave(c, True)), "perfil"))
-    niveis.append((("p", _chave(c, False)), "perfil"))
-    niveis.append((("f", c["faixa_etaria"]), "faixa"))
-    for chave, nivel in niveis:
-        if D["tam"].get(chave, 0) >= MIN_GRUPO:
-            return chave, nivel
-    return ("t",), "geral"
-
-
-def _descricao_grupo(c, nivel, consentimento):
-    if nivel == "geral":
-        return "quem usa o Conecta Recife"
-    texto = "pessoas " + _faixa_texto(c["faixa_etaria"])
-    if nivel == "perfil":
-        texto += " com perfil parecido com o seu"
-    return texto
-
-
 def _resumo(c, consentimento):
     partes = [f"{c['idade']} anos", f"mora na RPA {c['rpa']}" if c["rpa"] else ""]
     if c["empreende"]:
@@ -248,59 +220,53 @@ def _resumo(c, consentimento):
     return ", ".join(p for p in partes if p) + "."
 
 
-def _sugestoes(c, usados, interesses, consentimento):
-    servicos = D["servicos"]
-    chave, nivel = _grupo(c, consentimento)
-    contagem = D["pop"].get(chave, {})
-    tamanho = max(D["tam"].get(chave, 0), 1)
-    grupo_txt = _descricao_grupo(c, nivel, consentimento)
-    # Marcadores de saúde só entram com consentimento.
-    foco_saude = consentimento and any(c[m] for m in MARCADORES_SAUDE)
+def _reordenar(itens, faixa, interesses):
+    """Ajusta a ordem das sugestões sem remover nenhuma.
 
-    candidatos = []
-    for pos_cliques, sid in enumerate(D["ordem"]):
-        if sid in usados:
-            continue
-        s = servicos[sid]
-        pct = 100.0 * contagem.get(sid, 0) / tamanho
-        tema_int = next((t for t, n in zip(s["temas"], s["temas_norm"]) if n in interesses), None)
-        saude = foco_saude and TEMA_SAUDE in s["temas_norm"]
-        pontos = pct
-        if tema_int:
-            pontos = pontos * BONUS_INTERESSE_MULT + BONUS_INTERESSE_SOMA
-        if saude:
-            pontos = pontos * BONUS_SAUDE_MULT + BONUS_SAUDE_SOMA
-        # desempate: cliques_historico (D["ordem"] já está nessa ordem)
-        candidatos.append((-pontos, pos_cliques, sid, pct, tema_int, saude))
-    candidatos.sort()
+    1) afinidade < AFINIDADE_MIN na faixa da pessoa -> vai para o fim (mantém a ordem relativa);
+    2) tema em "interesses" -> sobe no máximo SOBE_INTERESSE posições (só entre os que não foram
+       para o fim).
+    """
+    afin = D["afinidade"].get(faixa, {})
+    bons = [x for x in itens if afin.get(x["servico_id"], 1.0) >= AFINIDADE_MIN]
+    fim = [x for x in itens if afin.get(x["servico_id"], 1.0) < AFINIDADE_MIN]
+
+    def de_interesse(x):
+        return any(n in interesses for n in D["servicos"][x["servico_id"]]["temas_norm"])
+
+    # chave: quem é de interesse "finge" estar 2 posições antes; empate favorece o de interesse.
+    ordenado = sorted(enumerate(bons), key=lambda ix: (
+        ix[0] - SOBE_INTERESSE if de_interesse(ix[1]) else ix[0],
+        0 if de_interesse(ix[1]) else 1, ix[0]))
+    return [x for _, x in ordenado] + fim
+
+
+def _sugestoes(cid, c, usados, interesses):
+    servicos = D["servicos"]
+    itens = []
+    for sid, im in D["reco"].get(cid, []):
+        sid = str(sid)
+        if sid in servicos and sid not in usados:
+            itens.append({"servico_id": sid, "motivo": D["motivos"][im]})
+    if len(itens) < MAX_SUGESTOES:  # reserva: mais procurados que a pessoa ainda não usou
+        tem = {x["servico_id"] for x in itens}
+        for sid in D["ordem"]:
+            if len(itens) == MAX_SUGESTOES:
+                break
+            if sid not in usados and sid not in tem:
+                itens.append({"servico_id": sid, "motivo": "É um dos serviços mais procurados no Conecta Recife."})
+    itens = _reordenar(itens[:MAX_SUGESTOES], c["faixa_etaria"], interesses)
 
     saida = []
-    for posicao, (_, _, sid, pct, tema_int, saude) in enumerate(candidatos[:MAX_SUGESTOES], 1):
-        s = servicos[sid]
-        if pct >= 1:
-            uso = f"{round(pct)} em cada 100 {grupo_txt} já usaram"
-        elif pct > 0:
-            uso = f"{grupo_txt} também usam"
-        else:
-            uso = ""
-        if tema_int and uso:
-            motivo = f"Combina com seu interesse em {tema_int}. " + uso[0].upper() + uso[1:] + "."
-        elif tema_int:
-            motivo = f"Combina com seu interesse em {tema_int}."
-        elif saude and uso:
-            motivo = "Serviço de saúde que pode ajudar você. " + uso[0].upper() + uso[1:] + "."
-        elif saude:
-            motivo = "Serviço de saúde que pode ajudar você."
-        elif uso:
-            motivo = uso[0].upper() + uso[1:] + "."
-        else:
-            motivo = "É um dos serviços mais procurados no Conecta Recife."
+    for posicao, x in enumerate(itens, 1):
+        s = servicos[x["servico_id"]]
+        tema_int = next((t for t, n in zip(s["temas"], s["temas_norm"]) if n in interesses), None)
         saida.append({
             "posicao": posicao,
-            "servico_id": sid,
+            "servico_id": x["servico_id"],
             "titulo": s["titulo"],
             "tema": tema_int or (s["temas"][0] if s["temas"] else ""),
-            "motivo": motivo,
+            "motivo": x["motivo"],
         })
     return saida
 
@@ -318,23 +284,36 @@ def montar_home(cid, interesses_txt, consentimento):
         "motivo": f"Você usou este serviço em {_data_br(quando[:10])}.",
     } for sid, quando in recentes]
 
-    sugestoes = _sugestoes(c, usos, interesses, consentimento)
+    sugestoes = _sugestoes(cid, c, usos, interesses)
 
-    # Em alta: não repete o que já aparece nos outros blocos da home.
+    # Em alta pela faixa etária da pessoa: não repete o que já aparece nos outros blocos.
     ja = {x["servico_id"] for x in continuar} | {x["servico_id"] for x in sugestoes}
-    n = D["n_semanas"]
-    periodo = "na última semana" if n == 1 else f"nas últimas {n} semanas"
+    faixa_txt = _faixa_texto(c["faixa_etaria"])
     em_alta = []
-    for sid, cliques in D["em_alta"]:
-        if sid in ja:
-            continue
-        em_alta.append({
-            "servico_id": sid,
-            "titulo": servicos[sid]["titulo"],
-            "motivo": f"Em alta no Recife: {_milhar(cliques)} acessos {periodo}.",
-        })
-        if len(em_alta) == MAX_EM_ALTA:
-            break
+    candidatos = D["alta_faixa"].get(c["faixa_etaria"])
+    if candidatos:
+        for x in candidatos:
+            sid = x["servico_id"]
+            if sid in ja or sid not in servicos:
+                continue
+            if x["anterior"] > 0:
+                mais = round(100.0 * (x["recente"] - x["anterior"]) / x["anterior"])
+                motivo = f"Em alta entre pessoas {faixa_txt}: {mais}% mais acessos nas últimas 4 semanas."
+            else:
+                motivo = f"Em alta entre pessoas {faixa_txt}: serviço novo nas últimas 4 semanas."
+            em_alta.append({"servico_id": sid, "titulo": servicos[sid]["titulo"], "motivo": motivo})
+            if len(em_alta) == MAX_EM_ALTA:
+                break
+    if len(em_alta) < MAX_EM_ALTA:  # reserva: em alta geral no Recife
+        n = D["n_semanas"]
+        periodo = "na última semana" if n == 1 else f"nas últimas {n} semanas"
+        for sid, cliques in D["em_alta"]:
+            if sid in ja or any(e["servico_id"] == sid for e in em_alta):
+                continue
+            em_alta.append({"servico_id": sid, "titulo": servicos[sid]["titulo"],
+                            "motivo": f"Em alta no Recife: {_milhar(cliques)} acessos {periodo}."})
+            if len(em_alta) == MAX_EM_ALTA:
+                break
 
     return {
         "cidadao": {
@@ -387,7 +366,7 @@ def lambda_handler(event, context):
             if not cid:
                 return _resposta(400, {"erro": "Informe o parâmetro cidadao_id. Exemplo: /home?cidadao_id=C007938"})
             if cid not in D["cidadaos"]:
-                return _resposta(404, {"erro": f"Cidadão '{cid}' não encontrado. Confira o cidadao_id informado."})
+                return _resposta(404, {"erro": "cidadão não encontrado"})
             return _resposta(200, montar_home(cid, _param(qs, "interesses"),
                                               _bool(_param(qs, "consentimento_saude"))))
 

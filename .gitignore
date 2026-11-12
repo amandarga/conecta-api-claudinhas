@@ -5,3 +5,4 @@ dados/
 __pycache__/
 *.json
 *.json.gz
+saida/
