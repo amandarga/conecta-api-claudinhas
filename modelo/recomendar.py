@@ -63,7 +63,7 @@ def prepare(serv, cid, hist, uso, vis):
     t = lambda c: cid[c].astype(str)
     mei_emp = ((cid.mei == 'True') | (cid.empreendedor == 'True')).astype(str)
     key = t('faixa_etaria') + '|' + t('cadastro_unico') + '|' + mei_emp + '|' + t('pessoa_com_deficiencia') \
-        + '|' + t('criancas_na_familia') + '|' + t('gestante')
+        + '|' + t('criancas_na_familia')
     grp = pd.factorize(key)[0]
     u = uso.copy()
     u['semana'] = pd.to_datetime(u.semana)
