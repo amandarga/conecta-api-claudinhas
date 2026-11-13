@@ -5,8 +5,9 @@ AWS Lambda (Python 3.12) atrás de uma Function URL. Sem pandas: só csv, json e
 
 Rotas:
   GET /temas
+  GET /servicos?q=<texto>   (busca no título e nos temas; até 10 resultados)
   POST /solicitacoes   {cidadao_id, servico_id, campos:{tipo, endereco, referencia, descricao}}
-  GET /solicitacoes/{protocolo}?servico_id=...
+  GET /solicitacoes/{protocolo}?servico_id=...   (servico_id é opcional nas duas rotas: sem ele, vale o serviço geral da ouvidoria)
   GET /home            (sem cidadao_id: home anônima, com ?interesses= opcional)
   GET /home?cidadao_id=C007938&interesses=Saúde|Educação&consentimento_saude=true
     interesses: nomes de /temas ou ids (saude, beneficios, esporte, emprego, estudos,
@@ -34,6 +35,10 @@ ARQUIVOS = ("servicos", "cidadaos", "historico", "uso_semanal")
 
 MAX_CONTINUE = 3
 MAX_SUGESTOES = 10
+# "solicitar": serviços em que a pessoa abre um pedido ou denúncia; "acessar": o resto.
+TEMAS_SOLICITAR = {"servicos urbanos", "ouvidoria e denuncias", "meio ambiente"}   # comparados com _norm
+SERVICO_GERAL_156 = "14"   # "Registrar uma manifestação na ouvidoria" (CGM), usado quando servico_id não vem
+N_INTERESSE_LOGADO = 2     # serviços dos interesses escolhidos garantidos nas 5 primeiras posições
 MAX_TEMA_TOP6 = 3         # no máximo 3 itens do mesmo tema nas posições 1-6
 MAX_TEMA_TOP10 = 5        # e no máximo 5 nas posições 1-10
 DOMINANTE_MIN = 0.40      # tema primário com >= 40% dos usos do histórico
@@ -146,6 +151,14 @@ def _interesses(texto):
     return [t for t, _ in _interesses_itens(texto)]
 
 
+def _tipo_acao(titulo, temas):
+    """Decidido só pelo tema: "solicitar" se algum tema do serviço está em TEMAS_SOLICITAR
+    (serviços urbanos, ouvidoria, meio ambiente); senão "acessar". O título não conta."""
+    if any(_norm(t) in TEMAS_SOLICITAR for t in temas):
+        return "solicitar"
+    return "acessar"
+
+
 def _data_br(data_iso):
     p = (data_iso or "").split("-")
     return f"{p[2]}/{p[1]}/{p[0]}" if len(p) == 3 else data_iso
@@ -186,6 +199,7 @@ def carregar(abrir, ler_saida):
                 "temas": ts,
                 "temas_norm": [_norm(t) for t in ts],
                 "cliques": _int(r.get("cliques_historico")),
+                "tipo_acao": _tipo_acao(titulo, ts),
             }
 
     # --- cidadãos ---
@@ -402,7 +416,24 @@ def _ordem_final(pool, tema_de, dominante=None, n=MAX_SUGESTOES):
     return final, promovido
 
 
-def _sugestoes(cid, c, usados, interesses):
+def _alvos_interesse(pool, interesses, temas_norm_de, n=N_INTERESSE_LOGADO):
+    """`pool`: ids não usados, do melhor para o pior. `interesses`: [(tema normalizado, nome)].
+    Devolve até n pares (servico_id, nome do interesse): o melhor serviço de cada interesse, revezando
+    entre eles na ordem dada (com um só interesse, os n melhores dele)."""
+    filas = [(nome, [s for s in pool if t in temas_norm_de(s)]) for t, nome in interesses]
+    alvos, vistos = [], set()
+    while len(alvos) < n and any(f for _, f in filas):
+        for nome, fila in filas:
+            while fila and fila[0] in vistos:
+                fila.pop(0)
+            if fila and len(alvos) < n:
+                sid = fila.pop(0)
+                alvos.append((sid, nome))
+                vistos.add(sid)
+    return alvos
+
+
+def _sugestoes(cid, c, usados, interesses, interesses_itens=()):
     servicos = D["servicos"]
     itens = []
     for sid, im in D["reco"].get(cid, []):
@@ -433,9 +464,25 @@ def _sugestoes(cid, c, usados, interesses):
         return t[0] if t else sid  # serviço sem tema não conta contra o limite de ninguém
 
     dominante = D["dominante"].get(cid)
-    ids, promovido = _ordem_final([x["servico_id"] for x in itens] + extras, tema_de, dominante)
+    pool = [x["servico_id"] for x in itens] + extras
+
+    # Interesses escolhidos (só quando há cidadão E interesses válidos; sem isso nada muda):
+    # os melhores serviços não usados desses temas entram logo depois do primeiro do ranking,
+    # ou seja, nas posições 2 e 3 (ou 1 e 2 se o primeiro já for de um interesse).
+    alvos = []
+    temas_validos = {_norm(t): t for t in D["temas"]}
+    escolhidos = [(t, (NOMES_AMIGAVEIS.get(id_) if id_ else None) or temas_validos[t])
+                  for t, id_ in interesses_itens if t in temas_validos]
+    if escolhidos:
+        alvos = _alvos_interesse(pool, escolhidos, lambda sid: servicos[sid]["temas_norm"])
+        ids_alvo = {sid for sid, _ in alvos}
+        pool = pool[:1] + [sid for sid, _ in alvos if sid != pool[0]] + [sid for sid in pool[1:] if sid not in ids_alvo]
+
+    ids, promovido = _ordem_final(pool, tema_de, dominante)
     if promovido:
         motivos[promovido] = f"Combina com o que você mais usa: {_nome_tema(dominante)}."
+    for sid, nome in alvos:
+        motivos[sid] = f"Você escolheu: {nome}"
 
     saida = []
     for posicao, sid in enumerate(ids, 1):
@@ -447,6 +494,7 @@ def _sugestoes(cid, c, usados, interesses):
             "titulo": s["titulo"],
             "tema": tema_int or (s["temas"][0] if s["temas"] else ""),
             "motivo": motivos[sid],
+            "tipo_acao": s["tipo_acao"],
         })
     return saida
 
@@ -487,7 +535,8 @@ def _completar_em_alta(em_alta, ja):
         if sid in ja or any(e["servico_id"] == sid for e in em_alta):
             continue
         em_alta.append({"servico_id": sid, "titulo": servicos[sid]["titulo"],
-                        "motivo": f"Em alta no Recife: {_milhar(cliques)} acessos {periodo}."})
+                        "motivo": f"Em alta no Recife: {_milhar(cliques)} acessos {periodo}.",
+                        "tipo_acao": servicos[sid]["tipo_acao"]})
         if len(em_alta) == MAX_EM_ALTA:
             break
 
@@ -496,7 +545,8 @@ def _proxima_acao(sugestoes, anonimo=False):
     if not sugestoes:
         return None
     p = sugestoes[0]
-    return {"servico_id": p["servico_id"], "titulo": p["titulo"], "frase": _frase_proxima(p["motivo"], anonimo)}
+    return {"servico_id": p["servico_id"], "titulo": p["titulo"], "tema": p["tema"],
+            "tipo_acao": p["tipo_acao"], "frase": _frase_proxima(p["motivo"], anonimo)}
 
 
 MAX_INTERESSE_ANONIMO = 2   # serviços de interesse na home anônima (posições 1 e 2)
@@ -530,7 +580,8 @@ def _sugestoes_anonimas(interesses):
         if sid not in ids:
             s = servicos[sid]
             itens.append((sid, s["temas"][0] if s["temas"] else "", "Muito procurado no Recife."))
-    return [{"posicao": pos, "servico_id": sid, "titulo": servicos[sid]["titulo"], "tema": tema, "motivo": motivo}
+    return [{"posicao": pos, "servico_id": sid, "titulo": servicos[sid]["titulo"], "tema": tema, "motivo": motivo,
+             "tipo_acao": servicos[sid]["tipo_acao"]}
             for pos, (sid, tema, motivo) in enumerate(itens[:MAX_SUGESTOES], 1)]
 
 
@@ -551,16 +602,18 @@ def montar_home(cid, interesses_txt, consentimento):
     c = D["cidadaos"][cid]
     servicos = D["servicos"]
     usos = D["usos"].get(cid, {})
-    interesses = _interesses(interesses_txt)
+    interesses_itens = _interesses_itens(interesses_txt)
+    interesses = [t for t, _ in interesses_itens]
 
     recentes = sorted(usos.items(), key=lambda kv: kv[1], reverse=True)[:MAX_CONTINUE]
     continuar = [{
         "servico_id": sid,
         "titulo": servicos[sid]["titulo"],
         "motivo": f"Você usou este serviço em {_data_br(quando[:10])}.",
+        "tipo_acao": servicos[sid]["tipo_acao"],
     } for sid, quando in recentes]
 
-    sugestoes = _sugestoes(cid, c, usos, interesses)
+    sugestoes = _sugestoes(cid, c, usos, interesses, interesses_itens)
 
     # Em alta pela faixa etária da pessoa: não repete o que já aparece nos outros blocos.
     ja = {x["servico_id"] for x in continuar} | {x["servico_id"] for x in sugestoes}
@@ -577,7 +630,8 @@ def montar_home(cid, interesses_txt, consentimento):
                 motivo = f"Em alta entre pessoas {faixa_txt}: {mais}% mais acessos nas últimas 4 semanas."
             else:
                 motivo = f"Em alta entre pessoas {faixa_txt}: serviço novo nas últimas 4 semanas."
-            em_alta.append({"servico_id": sid, "titulo": servicos[sid]["titulo"], "motivo": motivo})
+            em_alta.append({"servico_id": sid, "titulo": servicos[sid]["titulo"], "motivo": motivo,
+                            "tipo_acao": servicos[sid]["tipo_acao"]})
             if len(em_alta) == MAX_EM_ALTA:
                 break
     _completar_em_alta(em_alta, ja)
@@ -615,7 +669,7 @@ PROXIMOS_PASSOS = [
     "Nossa equipe vai analisar o pedido e o endereço informado.",
     "Guarde o protocolo para acompanhar o andamento.",
 ]
-OBRIGATORIOS = ("cidadao_id", "servico_id", "tipo", "endereco", "descricao")
+OBRIGATORIOS = ("cidadao_id", "tipo", "endereco", "descricao")   # servico_id é opcional (padrão: SERVICO_GERAL_156)
 INICIO_PROTOCOLOS = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp())
 _BASE36 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
@@ -681,7 +735,7 @@ def criar_solicitacao(event):
     except ValueError:
         return _resposta(400, {"erro": "O corpo da requisição deve ser um JSON válido."})
     if not isinstance(dados, dict):
-        return _resposta(400, {"erro": "O corpo da requisição deve ser um objeto JSON com cidadao_id, servico_id e campos."})
+        return _resposta(400, {"erro": "O corpo da requisição deve ser um objeto JSON com cidadao_id, campos e, se quiser, servico_id."})
     campos = dados.get("campos")
     if campos is None:
         campos = {}
@@ -694,7 +748,7 @@ def criar_solicitacao(event):
         return _resposta(400, {"erro": "Faltam campos obrigatórios: " + ", ".join(faltam) + "."})
     if valores["cidadao_id"].upper() not in D["cidadaos"]:
         return _resposta(404, {"erro": "cidadão não encontrado"})
-    servico = D["servicos"].get(valores["servico_id"])
+    servico = D["servicos"].get(valores["servico_id"] or SERVICO_GERAL_156)
     if not servico:
         return _resposta(404, {"erro": "serviço não encontrado"})
     agora = int(time.time())
@@ -705,12 +759,57 @@ def consultar_solicitacao(protocolo, servico_id):
     segundos = _ler_protocolo(protocolo)
     if segundos is None:
         return _resposta(404, {"erro": "protocolo não encontrado"})
-    if not servico_id:
-        return _resposta(400, {"erro": "Informe o parâmetro servico_id. Exemplo: /solicitacoes/CR-2026-ABC123?servico_id=199"})
-    servico = D["servicos"].get(servico_id)
+    servico = D["servicos"].get(servico_id or SERVICO_GERAL_156)
     if not servico:
         return _resposta(404, {"erro": "serviço não encontrado"})
     return _resposta(200, _solicitacao_json(segundos, servico["titulo"], int(time.time())))
+
+
+# ----------------------------------------------------------------------------
+# Busca de serviços: GET /servicos?q=<texto>
+# ----------------------------------------------------------------------------
+MAX_BUSCA = 10
+MIN_LETRAS_BUSCA = 2
+MSG_BUSCA_CURTA = "Digite pelo menos 2 letras."
+MSG_BUSCA_VAZIA = "Não encontramos esse serviço. Tente outra palavra."
+
+
+def buscar_servicos(q):
+    """Busca no título e nos temas, sem maiúsculas nem acentos. Com várias palavras, o serviço
+    precisa ter todas (no título ou nos temas, em qualquer ordem). Ranking: título que começa com o
+    texto, depois título que contém todas as palavras, depois só pelo tema; em cada grupo, pela
+    popularidade (D["ordem"]). Devolve no máximo MAX_BUSCA resultados."""
+    q = (q or "").replace("+", " ").strip()
+    resposta = {"q": q, "total": 0, "resultados": []}
+    if len(q) < MIN_LETRAS_BUSCA:
+        resposta["mensagem"] = MSG_BUSCA_CURTA
+        return resposta
+    palavras = _norm(q).split()
+    texto = " ".join(palavras)
+    grupos = ([], [], [])
+    for sid in D["ordem"]:  # já está em ordem de popularidade
+        s = D["servicos"][sid]
+        titulo = _norm(s["titulo"])
+        temas = " ".join(s["temas_norm"])
+        if not all(p in titulo or p in temas for p in palavras):
+            continue
+        if titulo.startswith(texto):
+            grupos[0].append(sid)
+        elif all(p in titulo for p in palavras):
+            grupos[1].append(sid)
+        else:
+            grupos[2].append(sid)
+    achados = grupos[0] + grupos[1] + grupos[2]
+    resposta["total"] = len(achados)
+    resposta["resultados"] = [{
+        "servico_id": sid,
+        "titulo": D["servicos"][sid]["titulo"],
+        "tema": D["servicos"][sid]["temas"][0] if D["servicos"][sid]["temas"] else "",
+        "tipo_acao": D["servicos"][sid]["tipo_acao"],
+    } for sid in achados[:MAX_BUSCA]]
+    if not achados:
+        resposta["mensagem"] = MSG_BUSCA_VAZIA
+    return resposta
 
 
 def _resposta(status, corpo):
@@ -750,6 +849,9 @@ def lambda_handler(event, context):
 
         if caminho == "/temas":
             return _resposta(200, {"temas": D["temas"]})
+
+        if caminho == "/servicos":
+            return _resposta(200, buscar_servicos(_param(qs, "q")))
 
         if caminho == "/home":
             cid = _param(qs, "cidadao_id").upper()

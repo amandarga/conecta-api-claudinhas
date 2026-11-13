@@ -4,7 +4,7 @@
 Uso:  py testar_local.py
 Procura os CSVs em .\\dados\\ ; se não existir, usa a pasta deste script.
 
-Chama /temas, /home (três cidadãos e a home anônima), /solicitacoes e os casos de erro.
+Chama /temas, /servicos, /home (três cidadãos e a home anônima), /solicitacoes e os casos de erro.
 
 Também precisa da pasta .\\saida\\ (ao lado deste script) com os arquivos do modelo:
   reco_api.json.gz, afinidade_faixa.json e em_alta_faixa.json
@@ -61,6 +61,16 @@ def main():
     print(f"GET /temas -> {status} em {ms:.1f} ms | {len(corpo['temas'])} temas")
     print("  " + " · ".join(corpo["temas"]) + "\n")
 
+    # --- busca de serviços ---
+    for q in ("iptu", "saude consulta", "x", "zzzzqqq"):
+        status, b, ms = chamar("/servicos", {"q": q})
+        print(f"GET /servicos?q={q} -> {status} em {ms:.1f} ms | total {b['total']}"
+              + (f" | {b['mensagem']}" if "mensagem" in b else ""))
+        for x in b["resultados"][:3]:
+            print(f"    [{x['servico_id']:>4}] {x['titulo']}  ({x['tema']}, {x['tipo_acao']})")
+        assert status == 200 and len(b["resultados"]) <= 10
+    print()
+
     for cid, extra in CASOS:
         qs = {"cidadao_id": cid, **extra}
         status, h, ms = chamar("/home", qs)
@@ -111,6 +121,10 @@ def main():
     print(f"GET /solicitacoes/{s['protocolo']}?servico_id={sid} -> {status} em {ms:.1f} ms")
     print("  linha do tempo: " + " > ".join(f"{e['etapa']} ({e['status']})" for e in s2["linha_do_tempo"]))
     assert status == 200 and s2["protocolo"] == s["protocolo"]
+    sem_servico = {"cidadao_id": pedido["cidadao_id"], "campos": pedido["campos"]}
+    status, s3, ms = chamar("/solicitacoes", metodo="POST", corpo=sem_servico)
+    print(f"POST /solicitacoes (sem servico_id) -> {status} | serviço: {s3.get('servico')}")
+    assert status == 201
     print()
 
     # --- erros ---

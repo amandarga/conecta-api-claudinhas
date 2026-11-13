@@ -31,10 +31,15 @@ Todas as respostas são JSON em UTF-8 (`Content-Type: application/json; charset=
 | Rota | Para que serve |
 |---|---|
 | `GET /temas` | Lista dos temas dos serviços |
+| `GET /servicos?q=...` | Busca de serviços por texto |
 | `GET /home?cidadao_id=...` | Home personalizada de um cidadão |
 | `GET /home` (sem `cidadao_id`) | Home anônima, para visitante |
 | `POST /solicitacoes` | Abre uma solicitação e devolve o protocolo |
-| `GET /solicitacoes/{protocolo}?servico_id=...` | Acompanha uma solicitação |
+| `GET /solicitacoes/{protocolo}` | Acompanha uma solicitação |
+
+Todo serviço devolvido pela API traz `tipo_acao`: `"solicitar"` quando é um serviço em que a pessoa
+abre um pedido ou denúncia (temas Serviços Urbanos, Ouvidoria e Denúncias e Meio Ambiente) e
+`"acessar"` nos demais.
 
 ### `GET /temas`
 
@@ -43,6 +48,26 @@ Lista única e ordenada dos temas dos serviços.
 ```json
 {"temas": ["Administração Pública", "Animais", "Cidadania", "..."]}
 ```
+
+### `GET /servicos?q=<texto>`
+
+Busca no título e nos temas, sem diferenciar maiúsculas nem acentos. Com várias palavras, o serviço
+precisa ter todas. Devolve até 10 resultados, nesta ordem: título que começa com o texto, título que
+contém todas as palavras, depois os encontrados só pelo tema; dentro de cada grupo, os mais usados primeiro.
+
+```json
+{
+  "q": "iptu",
+  "total": 16,
+  "resultados": [
+    {"servico_id": "494", "titulo": "Pagar IPTU de 2026", "tema": "Imóveis", "tipo_acao": "acessar"}
+  ]
+}
+```
+
+`total` é o número de serviços encontrados (pode ser maior que os 10 devolvidos). Com menos de 2
+letras ou sem resultado, a resposta continua `200`, com a lista vazia e um campo `mensagem`
+(por exemplo, `"Não encontramos esse serviço. Tente outra palavra."`).
 
 ### `GET /home`
 
@@ -83,21 +108,25 @@ Formato da resposta (os textos abaixo são ilustrativos):
   },
   "continue": [
     {"servico_id": "519", "titulo": "Ver resultado de exames laboratoriais",
-     "motivo": "Você usou este serviço em 11/09/2026."}
+     "motivo": "Você usou este serviço em 11/09/2026.", "tipo_acao": "acessar"}
   ],
   "sugestoes": [
     {"posicao": 1, "servico_id": "942",
      "titulo": "Agendar consultas e procedimentos na Minha Unidade de Saúde",
      "tema": "Saúde",
-     "motivo": "Quem usou Ver resultado de exames também costuma usar este"}
+     "motivo": "Quem usou Ver resultado de exames também costuma usar este",
+     "tipo_acao": "acessar"}
   ],
   "em_alta": [
     {"servico_id": "858", "titulo": "Realizar agendamento para a Academia Recife",
-     "motivo": "Em alta entre pessoas de 60 a 74 anos: 35% mais acessos nas últimas 4 semanas."}
+     "motivo": "Em alta entre pessoas de 60 a 74 anos: 35% mais acessos nas últimas 4 semanas.",
+     "tipo_acao": "acessar"}
   ],
   "proxima_acao": {
     "servico_id": "942",
     "titulo": "Agendar consultas e procedimentos na Minha Unidade de Saúde",
+    "tema": "Saúde",
+    "tipo_acao": "acessar",
     "frase": "Quem usa Ver resultado de exames costuma precisar disto."
   }
 }
@@ -132,8 +161,9 @@ Corpo em JSON:
 }
 ```
 
-`cidadao_id`, `servico_id`, `tipo`, `endereco` e `descricao` são obrigatórios; `referencia` é opcional.
-Resposta `201`:
+`cidadao_id`, `tipo`, `endereco` e `descricao` são obrigatórios; `referencia` é opcional.
+`servico_id` também é opcional: sem ele, a solicitação vai para o serviço geral da ouvidoria
+("Registrar uma manifestação na ouvidoria"). Resposta `201`:
 
 ```json
 {
@@ -151,9 +181,10 @@ Resposta `201`:
 }
 ```
 
-### `GET /solicitacoes/{protocolo}?servico_id=...`
+### `GET /solicitacoes/{protocolo}`
 
-Devolve o mesmo formato, com a linha do tempo atualizada.
+Devolve o mesmo formato, com a linha do tempo atualizada. O parâmetro `servico_id` é opcional
+(`?servico_id=199`); sem ele, vale o serviço geral da ouvidoria.
 
 **Limite desta versão (demonstração):** as solicitações não são armazenadas. O protocolo carrega o
 horário de abertura e as etapas avançam conforme o tempo passa (1, 3 e 5 minutos), para mostrar o
@@ -163,7 +194,7 @@ acompanhamento na tela. O conteúdo de `campos` é validado, mas não é guardad
 
 | Status | Quando |
 |---|---|
-| `400` | Corpo inválido ou campo obrigatório faltando em `/solicitacoes`; `servico_id` ausente na consulta |
+| `400` | Corpo inválido ou campo obrigatório faltando em `/solicitacoes` |
 | `404` | `cidadao_id`, serviço, protocolo ou rota inexistente |
 | `405` | Método não permitido para a rota |
 | `500` | Erro interno |
@@ -179,7 +210,9 @@ acompanhamento na tela. O conteúdo de `campos` é validado, mas não é guardad
    os serviços mais procurados que ela ainda não usou.
 2. **Ajuste por faixa etária:** serviço com afinidade abaixo de 0,5 na faixa etária da pessoa
    (`saida/afinidade_faixa.json`) vai para o fim da lista.
-3. **Interesses:** serviço de um tema informado em `interesses` sobe no máximo 2 posições.
+3. **Interesses:** serviço de um tema informado em `interesses` sobe no máximo 2 posições. Além
+   disso, os 2 melhores serviços ainda não usados dos temas escolhidos entram logo depois do
+   primeiro da lista, com o motivo "Você escolheu: ...".
 4. **Diversidade de temas:** no máximo 3 serviços do mesmo tema nas posições 1 a 6 e no máximo 5
    nas posições 1 a 10.
 5. **Tema mais usado:** se um tema concentra 40% ou mais dos usos da pessoa, o melhor serviço desse
@@ -217,7 +250,7 @@ do script, os arquivos `reco_api.json.gz`, `afinidade_faixa.json` e `em_alta_fai
 py testar_local.py
 ```
 
-O teste não usa S3. Ele chama `/temas`, `/home` para C007938, C068579 e C076260, a home anônima,
+O teste não usa S3. Ele chama `/temas`, `/servicos`, `/home` para C007938, C068579 e C076260, a home anônima,
 a abertura e a consulta de uma solicitação e os casos de erro.
 
 ## Publicação na AWS
