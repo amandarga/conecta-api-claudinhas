@@ -4,7 +4,9 @@
 Uso:  py testar_local.py
 Procura os CSVs em .\\dados\\ ; se não existir, usa a pasta deste script.
 
-A v2 também precisa da pasta .\\saida\\ (ao lado deste script) com os arquivos do modelo:
+Chama /temas, /home (três cidadãos e a home anônima), /solicitacoes e os casos de erro.
+
+Também precisa da pasta .\\saida\\ (ao lado deste script) com os arquivos do modelo:
   reco_api.json.gz, afinidade_faixa.json e em_alta_faixa.json
 baixados de s3://claudinhas-dados-hack/saida/
 """
@@ -32,9 +34,13 @@ CASOS = [
 ]
 
 
-def chamar(caminho, qs=None):
+def chamar(caminho, qs=None, metodo="GET", corpo=None):
+    evento = {"rawPath": caminho, "queryStringParameters": qs or None,
+              "requestContext": {"http": {"method": metodo}}}
+    if corpo is not None:
+        evento["body"] = json.dumps(corpo, ensure_ascii=False)
     t0 = time.perf_counter()
-    r = lf.lambda_handler({"rawPath": caminho, "queryStringParameters": qs or None}, None)
+    r = lf.lambda_handler(evento, None)
     ms = (time.perf_counter() - t0) * 1000
     assert r["headers"]["Content-Type"].startswith("application/json"), r["headers"]
     return r["statusCode"], json.loads(r["body"]), ms
@@ -73,15 +79,53 @@ def main():
         print("  EM ALTA")
         for x in h["em_alta"]:
             print(f"    [{x['servico_id']:>4}] {x['titulo']}\n           -> {x['motivo']}")
+        p = h.get("proxima_acao")
+        if p:
+            print(f"  PRÓXIMA AÇÃO\n    [{p['servico_id']:>4}] {p['titulo']}\n           -> {p['frase']}")
         usados = set(lf.D["usos"].get(cid, {}))
         assert not usados & {x["servico_id"] for x in h["sugestoes"]}, "sugestão repetiu serviço já usado"
         assert ms < 1000, "requisição passou de 1 segundo"
         print()
 
+    # --- home anônima (sem cidadao_id) ---
     print("=" * 100)
-    for caminho, qs in (("/home", {"cidadao_id": "C999999"}), ("/home", None), ("/outra", None)):
-        status, corpo, ms = chamar(caminho, qs)
-        print(f"GET {caminho} {qs or ''} -> {status} {json.dumps(corpo, ensure_ascii=False)}")
+    for qs in (None, {"interesses": "saude,emprego"}):
+        status, h, ms = chamar("/home", qs)
+        print(f"GET /home {qs or '(sem parâmetros)'} -> {status} em {ms:.1f} ms | resumo: {h['cidadao']['resumo']}")
+        for x in h["sugestoes"]:
+            print(f"    {x['posicao']:>2}. [{x['servico_id']:>4}] {x['titulo']}  ({x['tema']})\n           -> {x['motivo']}")
+        assert status == 200 and h["cidadao"]["id"] is None and h["continue"] == []
+        print()
+
+    # --- solicitações ---
+    print("=" * 100)
+    sid = lf.D["ordem"][0]
+    pedido = {"cidadao_id": CASOS[0][0], "servico_id": sid,
+              "campos": {"tipo": "Teste", "endereco": "Rua da Aurora, 100",
+                         "referencia": "Em frente à praça", "descricao": "Solicitação de teste local."}}
+    status, s, ms = chamar("/solicitacoes", metodo="POST", corpo=pedido)
+    print(f"POST /solicitacoes -> {status} em {ms:.1f} ms")
+    print("  " + json.dumps(s, ensure_ascii=False))
+    assert status == 201 and s["protocolo"].startswith("CR-2026-")
+    status, s2, ms = chamar(f"/solicitacoes/{s['protocolo']}", {"servico_id": sid})
+    print(f"GET /solicitacoes/{s['protocolo']}?servico_id={sid} -> {status} em {ms:.1f} ms")
+    print("  linha do tempo: " + " > ".join(f"{e['etapa']} ({e['status']})" for e in s2["linha_do_tempo"]))
+    assert status == 200 and s2["protocolo"] == s["protocolo"]
+    print()
+
+    # --- erros ---
+    print("=" * 100)
+    erros = (
+        ("GET", "/home", {"cidadao_id": "C999999"}, None, 404),
+        ("GET", "/outra", None, None, 404),
+        ("GET", "/solicitacoes/CR-2026-ZZZZZZ", {"servico_id": sid}, None, 404),
+        ("POST", "/solicitacoes", None, {"cidadao_id": CASOS[0][0]}, 400),
+        ("GET", "/solicitacoes", None, None, 405),
+    )
+    for metodo, caminho, qs, corpo_req, esperado in erros:
+        status, corpo, ms = chamar(caminho, qs, metodo=metodo, corpo=corpo_req)
+        print(f"{metodo} {caminho} {qs or ''} -> {status} {json.dumps(corpo, ensure_ascii=False)}")
+        assert status == esperado, f"esperava {esperado}"
     print("\nOK: sugestões não repetem serviços usados e todas as respostas vieram em menos de 1 s.")
 
 
